@@ -1,0 +1,3 @@
+- insert:
+    - id: 'dsh-plugin-mobile-access:mobile-access'
+      name: dsh-plugin-mobile-access

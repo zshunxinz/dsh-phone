@@ -1,0 +1,39 @@
+{
+  "name": "dsh-plugin-mobile-access",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Token unlock page for installed DSH Web apps and a full-collapse mobile sidebar.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zshunxinz/dsh-phone.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "icon-data.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "tests/smoke.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
+
