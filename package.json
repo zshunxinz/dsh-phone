@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-mobile-access",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Token unlock page for installed DSH Web apps and a full-collapse mobile sidebar.",
@@ -36,4 +36,5 @@
     }
   }
 }
+
 

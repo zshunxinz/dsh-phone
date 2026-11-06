@@ -6,7 +6,7 @@ DSH 手机端访问插件（包名 `dsh-plugin-mobile-access`）：令牌解锁�
 
 1. **让令牌变成可以输入的参数**。安装后的手机应用从 `/unlock` 启动，输入一次访问令牌即可登录；之后由 `HttpOnly` Cookie 记住登录状态。
 2. **手机宽度下完全收起侧边栏**。侧边栏从 56px 图标导轨变成 0 宽，对话占满屏幕；左边缘把手以覆盖式抽屉打开菜单。
-3. **版本与更新**。设置页检查 DSH 运行时与插件自身的新版本；插件可一键下载并应用更新（Host 半边需重载行或重启）。
+3. **版本与更新**。设置页检查 DSH 运行时与插件自身的新版本；插件可一键下载并应用更新（Host 半边需重载行或重启），DSH 运行时则通过服务器上的一次性更新脚本完成安装、重启与回滚。
 
 不改动 DSH 源码，Windows 与 Linux 上的 `dsh web` 通用；安装目录可整体复制到另一台机器。
 
@@ -82,8 +82,81 @@ Copy-Item "D:\plugins\dsh-mobile-access\*" "$plugins\dsh-mobile-access" -Recurse
 设置页的「版本与更新」会显示 **DSH 运行时** 和 **本插件** 的当前 / 最新版本（DSH 取 npm registry 的 `@deepseek-ai/dsh`，插件取 GitHub Release）。
 
 - **更新插件**：从 GitHub 最新 Release 下载 `.tgz`，校验包名后原子替换自身文件（先备份，失败自动还原）。`client.js` 会被客户端 HMR 自动热替换；`index.js` 属于 Host 半边，需要**重载插件行或重启 `dsh web`** 才生效。
-- **更新 DSH**：DSH 是正在运行的服务，插件不能安全地替换并重启它。检查到新版本后会给出启动命令（`npx -y @deepseek-ai/dsh@latest web`），保留你原来的启动参数、停止旧进程后用新版本启动即可。
+- **更新 DSH**：插件本身保持轻量，只负责“查版本 + 触发脚本 + 读状态”；安装、校验、切换版本、重启、回滚都由服务器上一次性安装的 `~/.dsh/dsh-update.sh` 完成。检测到新版本时出现「更新 DSH」按钮，点击后轮询 `/mobile-access/update-status` 直到 `ok` 或 `rollback`。
 - 检查结果缓存 10 分钟；界面上的「检查更新」会强制刷新。
+
+### 一次性配置（更新 DSH 需要）
+
+```bash
+# 1) Node >= 24.9
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 2) 版本目录 + 当前版本
+mkdir -p ~/.dsh/runtimes ~/.dsh/logs
+npm install --prefix ~/.dsh/runtimes/dsh-0.2.1-rc.5 @deepseek-ai/dsh@0.2.1-rc.5 --no-audit --no-fund
+echo dsh-0.2.1-rc.5 > ~/.dsh/runtimes/current
+
+# 3) 启动包装脚本
+cat > ~/.dsh/run-dsh-web.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+RT="$HOME/.dsh/runtimes"
+exec /usr/bin/node "$RT/$(cat "$RT/current")/node_modules/@deepseek-ai/dsh/lib/bin.js" web --no-open \
+  --trusted-host dsh.zhoushunxin.cn --trusted-host dsh.zhoushunxin.cn:443
+EOF
+chmod +x ~/.dsh/run-dsh-web.sh
+
+# 4) 更新脚本（安装 → 校验 → 切换 → 重启 → 健康检查 → 回滚）
+cat > ~/.dsh/dsh-update.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+RT="$HOME/.dsh/runtimes"
+STATUS="$HOME/.dsh/update-status.json"
+LOG="$HOME/.dsh/logs/dsh-update.log"
+TARGET="${1:?usage: dsh-update.sh <version>}"
+CUR="$(cat "$RT/current" 2>/dev/null || true)"
+DIR="dsh-$TARGET"
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+status() { printf '{"at":"%s","state":"%s","from":"%s","to":"%s","error":"%s"}\n' \
+  "$(now)" "$1" "$CUR" "$TARGET" "${2:-}" > "$STATUS"; }
+mkdir -p "$RT" "$(dirname "$LOG")"
+echo "[$(now)] $CUR -> $TARGET" >> "$LOG"
+status installing
+if [ ! -d "$RT/$DIR/node_modules/@deepseek-ai/dsh" ]; then
+  npm install --prefix "$RT/$DIR" "@deepseek-ai/dsh@$TARGET" --no-audit --no-fund >> "$LOG" 2>&1 \
+    || { status failed install; exit 1; }
+fi
+status verifying
+node "$RT/$DIR/node_modules/@deepseek-ai/dsh/lib/bin.js" web --help >> "$LOG" 2>&1 \
+  || { status failed verify; exit 1; }
+echo "$CUR" > "$RT/previous"
+echo "$DIR" > "$RT/current"
+status restarting
+sleep 1   # 让插件的 202 响应先发出
+sudo -n /bin/systemctl restart dsh-web >> "$LOG" 2>&1 \
+  || { echo "$CUR" > "$RT/current"; status rollback restart-failed; exit 1; }
+for _ in $(seq 1 60); do
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/unlock || true)" = "200" ]; then
+    status ok; exit 0
+  fi
+  sleep 1
+done
+echo "$CUR" > "$RT/current"
+sudo -n /bin/systemctl restart dsh-web >> "$LOG" 2>&1 || true
+status rollback unhealthy
+exit 2
+EOF
+chmod +x ~/.dsh/dsh-update.sh
+
+# 5) systemd 单元指向包装脚本 + 允许该服务重启
+sudo sed -i 's#^ExecStart=.*#ExecStart=/home/ubuntu/.dsh/run-dsh-web.sh#' /etc/systemd/system/dsh-web.service
+sudo systemctl daemon-reload
+echo 'ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart dsh-web' | sudo tee /etc/sudoers.d/dsh-web-restart
+sudo chmod 440 /etc/sudoers.d/dsh-web-restart
+```
+
+> 更新完成后 DSH 会重启，**令牌随之变化**，所有设备需要在新解锁页重新输入一次令牌（这是 DSH 的既有行为）。
 
 ## 路由
 
@@ -93,6 +166,10 @@ Copy-Item "D:\plugins\dsh-mobile-access\*" "$plugins\dsh-mobile-access" -Recurse
 | `GET /manifest.webmanifest` | 无 | 在原始 manifest 上把 `start_url` 指向 `./unlock`，保留 `id: "./"` 让 WebAPK 原地升级 |
 | `GET /mobile-access/login-url` | 需要已登录 | 返回当前进程令牌拼好的登录地址 |
 | `GET /mobile-access/networks` | 需要已登录 | 本机局域网 IPv4 候选地址 |
+| `GET /mobile-access/versions` | 需要已登录 | DSH / 插件的当前与最新版本、Node 要求、更新脚本是否就绪 |
+| `POST /mobile-access/update-plugin` | 需要已登录 | 下载并应用插件自身的 GitHub Release |
+| `POST /mobile-access/update-dsh` | 需要已登录 | 校验 Node 版本后调用 `~/.dsh/dsh-update.sh`，返回 202 |
+| `GET /mobile-access/update-status` | 需要已登录 | 读取 `~/.dsh/update-status.json`（脚本写入的更新状态） |
 
 令牌只在同源页面之间传递给已认证的调用方，不写入 localStorage，也不出现在 `/unlock` 的 HTML 里。
 

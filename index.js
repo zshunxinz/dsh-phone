@@ -20,7 +20,8 @@
  * Windows and Linux unchanged. Every registration is an effect owned by the
  * plugin fiber, so unloading restores the stock routes.
  */
-import { networkInterfaces } from 'node:os'
+import { networkInterfaces, homedir } from 'node:os'
+import { spawn } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -43,12 +44,15 @@ const ICON_512_PATH = '/mobile-access/icon-512.png'
 const ICON_MASKABLE_PATH = '/mobile-access/icon-maskable-512.png'
 const VERSIONS_PATH = '/mobile-access/versions'
 const UPDATE_PLUGIN_PATH = '/mobile-access/update-plugin'
+const UPDATE_DSH_PATH = '/mobile-access/update-dsh'
+const UPDATE_STATUS_PATH = '/mobile-access/update-status'
 
 /** Source of the plugin's own newer releases. */
 const RELEASES_API = 'https://api.github.com/repos/zshunxinz/dsh-phone/releases'
 const DSH_REGISTRY_API = 'https://registry.npmjs.org/@deepseek-ai/dsh/latest'
 const VERSIONS_TTL_MS = 10 * 60 * 1000
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
+const UPDATE_IN_PROGRESS_MS = 10 * 60 * 1000
 
 /** The stock Web app manifest with a token page as the launch target. */
 const MANIFEST = {
@@ -358,6 +362,100 @@ function isNewerVersion(candidate, current) {
   return candidate !== current
 }
 
+/** The DSH home directory: `$DSH_HOME` when set, otherwise `~/.dsh`. */
+function dshHome() {
+  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+}
+
+/** The one-time updater script the server owner installs next to the DSH home. */
+function updaterScript() {
+  return join(dshHome(), 'dsh-update.sh')
+}
+
+/** Numeric comparison of the major.minor.patch core of two versions. */
+function compareVersionCores(a, b) {
+  const parse = (value) => value.replace(/^v/, '').split('-')[0].split('.').map((part) => Number.parseInt(part, 10) || 0)
+  const left = parse(a)
+  const right = parse(b)
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] > right[index]) return 1
+    if (left[index] < right[index]) return -1
+  }
+  return 0
+}
+
+/** Minimal `engines.node` range check for simple `>=`, `<=`, `>`, `<`, `=` atoms. */
+function satisfiesVersionRange(version, range) {
+  if (typeof range !== 'string' || range.trim() === '') return true
+  for (const token of range.trim().split(/\s+/)) {
+    if (token === '||') continue
+    const match = /^(>=|<=|>|<|=)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(token)
+    if (match === null) continue
+    const comparison = compareVersionCores(version, match[2])
+    const operator = match[1] ?? '='
+    const ok = operator === '>=' ? comparison >= 0
+      : operator === '<=' ? comparison <= 0
+        : operator === '>' ? comparison > 0
+          : operator === '<' ? comparison < 0
+            : comparison === 0
+    if (!ok) return false
+  }
+  return true
+}
+
+/** The latest update status the script wrote, or null when the file is missing. */
+function readUpdateStatus() {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dshHome(), 'update-status.json'), 'utf8'))
+    return typeof parsed === 'object' && parsed !== null ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/** True while a recent run is still installing, verifying, or restarting. */
+function updateInProgress(status) {
+  if (status === null || typeof status.at !== 'string') return false
+  if (status.state !== 'installing' && status.state !== 'verifying' && status.state !== 'restarting') return false
+  const age = Date.now() - Date.parse(status.at)
+  return Number.isFinite(age) && age >= 0 && age < UPDATE_IN_PROGRESS_MS
+}
+
+/** Read a small JSON request body; returns `{}` for an absent or invalid body. */
+function readJsonBody(req, limit = 16384) {
+  return new Promise((resolve) => {
+    if (typeof req.on !== 'function') {
+      resolve({})
+      return
+    }
+    const chunks = []
+    let size = 0
+    let settled = false
+    const settle = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        settle(null)
+        req.destroy?.()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        settle(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
+      } catch {
+        settle(null)
+      }
+    })
+    req.on('error', () => settle(null))
+  })
+}
+
 /**
  * Register the unlock page, the launch manifest, and the authenticated helpers.
  * @param ctx - Host context carrying `webServer`; `connection` is read when present.
@@ -418,15 +516,22 @@ export function apply(ctx) {
     if (!refresh && versionsState.value !== null && Date.now() - versionsState.at < VERSIONS_TTL_MS) {
       return versionsState.value
     }
+    const script = updaterScript()
     const [dshCurrent, dshLatest, pluginLatest] = await Promise.all([
       dshRuntimeVersion(),
-      fetchJson(DSH_REGISTRY_API).then((payload) => typeof payload.version === 'string' ? payload.version : null).catch(() => null),
+      fetchJson(DSH_REGISTRY_API).then((payload) => ({
+        version: typeof payload.version === 'string' ? payload.version : null,
+        enginesNode: typeof payload.engines?.node === 'string' ? payload.engines.node : null,
+      })).catch(() => ({ version: null, enginesNode: null })),
       fetchJson(`${RELEASES_API}/latest`).then((payload) => typeof payload.tag_name === 'string' ? payload.tag_name.replace(/^v/, '') : null).catch(() => null),
     ])
     const value = {
       dsh: {
         current: dshCurrent,
-        latest: dshLatest,
+        latest: dshLatest.version,
+        enginesNode: dshLatest.enginesNode,
+        node: process.version,
+        updaterAvailable: existsSync(script),
         registry: 'https://www.npmjs.com/package/@deepseek-ai/dsh',
       },
       plugin: {
@@ -575,6 +680,84 @@ export function apply(ctx) {
       sendJson(res, 200, await performPluginUpdate())
     } catch (error) {
       sendJson(res, 500, { error: 'update-failed', detail: String(error?.message ?? error) })
+    }
+  }
+
+  const updateStatusHandler = (req, res) => {
+    if ((req.method ?? 'GET') !== 'GET') {
+      send(res, 405, { allow: 'GET', 'cache-control': 'no-store' }, '')
+      return
+    }
+    const connection = ctx.get('connection')
+    if (connection === undefined) {
+      sendJson(res, 503, { error: 'connection-unavailable' })
+      return
+    }
+    const admission = connection.admit({ headers: req.headers })
+    if (admission.rejection !== undefined) {
+      sendJson(res, admission.rejection, { error: admission.rejection === 403 ? 'untrusted-authority' : 'unauthenticated' })
+      return
+    }
+    sendJson(res, 200, readUpdateStatus() ?? { state: 'idle' })
+  }
+
+  const updateDshHandler = async (req, res) => {
+    if ((req.method ?? 'GET') !== 'POST') {
+      send(res, 405, { allow: 'POST', 'cache-control': 'no-store' }, '')
+      return
+    }
+    const connection = ctx.get('connection')
+    if (connection === undefined) {
+      sendJson(res, 503, { error: 'connection-unavailable' })
+      return
+    }
+    const admission = connection.admit({ headers: req.headers })
+    if (admission.rejection !== undefined) {
+      sendJson(res, admission.rejection, { error: admission.rejection === 403 ? 'untrusted-authority' : 'unauthenticated' })
+      return
+    }
+    const script = updaterScript()
+    if (!existsSync(script)) {
+      sendJson(res, 409, { error: 'updater-not-installed', script })
+      return
+    }
+    const body = await readJsonBody(req)
+    const query = new URL(req.url ?? UPDATE_DSH_PATH, 'http://dsh.invalid')
+    const requested = typeof body?.version === 'string' ? body.version : query.searchParams.get('version')
+    const explicit = typeof requested === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requested) ? requested : null
+    let payload
+    try {
+      payload = await versionsPayload(true)
+    } catch {
+      sendJson(res, 502, { error: 'registry-unreachable' })
+      return
+    }
+    const target = explicit ?? payload.dsh.latest
+    if (target === null) {
+      sendJson(res, 502, { error: 'registry-unreachable' })
+      return
+    }
+    if (payload.dsh.current === target) {
+      sendJson(res, 200, { accepted: false, reason: 'up-to-date', current: payload.dsh.current, target })
+      return
+    }
+    const engines = payload.dsh.enginesNode
+    if (engines !== null && !satisfiesVersionRange(process.version, engines)) {
+      sendJson(res, 409, { error: 'node-too-old', required: engines, current: process.version })
+      return
+    }
+    const status = readUpdateStatus()
+    if (updateInProgress(status)) {
+      sendJson(res, 409, { error: 'update-in-progress', state: status.state })
+      return
+    }
+    sendJson(res, 202, { accepted: true, target, scheduled: true })
+    try {
+      const child = spawn('bash', [script, target], { detached: true, stdio: 'ignore', cwd: dshHome() })
+      child.on('error', () => {})
+      child.unref()
+    } catch (error) {
+      ctx.get('logger')?.warn?.('mobile-access: failed to start the DSH updater', error)
     }
   }
 
@@ -759,6 +942,18 @@ export function apply(ctx) {
     path: UPDATE_PLUGIN_PATH,
     handler: updatePluginHandler,
   }), 'mobile-access: plugin update')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: UPDATE_DSH_PATH,
+    handler: updateDshHandler,
+  }), 'mobile-access: dsh update')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: UPDATE_STATUS_PATH,
+    handler: updateStatusHandler,
+  }), 'mobile-access: dsh update status')
 
   ctx.get('logger')?.info?.('mobile access plugin mounted at %s', UNLOCK_PATH)
 }

@@ -72,9 +72,18 @@ window.__ModuleLoader__.load({
       pluginUpToDate: '插件已是最新版本。',
       pluginUpdateFailed: '更新失败：%s',
       dshUpdateTitle: '更新 DSH',
-      dshUpdateHint: 'DSH 是正在运行的服务，不能在应用内替换自身：停止当前进程后，用新版本重新启动（保留你原来的启动参数）。',
+      dshUpdateHint: '更新会调用服务器上的 dsh-update.sh：安装 → 校验 → 切换 → 重启；重启后令牌会变化，设备需要重新解锁。',
       copyUpdateCommand: '复制更新命令',
       versionsFailed: '检查失败，请确认服务器可以访问 npm / GitHub。',
+      dshUpdateButton: '更新 DSH',
+      dshUpdating: '正在更新 DSH…',
+      dshUpdateStarted: '已开始更新，服务将在几秒后重启…',
+      dshUpdateRestarted: '已更新到 v%s。请刷新页面；DSH 重启后令牌会变化，需要重新解锁。',
+      dshUpdateFailed: '更新失败：%s',
+      dshUpdaterMissing: '未安装更新脚本：请先按 README 完成一次性配置（创建 ~/.dsh/dsh-update.sh）。',
+      dshNodeTooOld: '需要 Node %s，当前 %s，请先升级 Node。',
+      dshUpdateInProgress: '已有更新正在进行，请稍后。',
+      dshNodeLine: 'Node %s · 要求 %s',
       generated: '已生成。',
       forbidden: '服务器拒绝了该地址（403）。请检查 trustedHosts 配置。',
       expired: '登录状态已失效，请重新生成登录链接。',
@@ -132,9 +141,18 @@ window.__ModuleLoader__.load({
       pluginUpToDate: 'The plugin is already up to date.',
       pluginUpdateFailed: 'Update failed: %s',
       dshUpdateTitle: 'Update DSH',
-      dshUpdateHint: 'DSH is the running service and cannot replace itself: stop the current process and start the new version with your original arguments.',
+      dshUpdateHint: 'The update runs the server-side dsh-update.sh: install, verify, switch, restart. The token rotates on restart, so devices must unlock again.',
       copyUpdateCommand: 'Copy update command',
       versionsFailed: 'Check failed; make sure the server can reach npm and GitHub.',
+      dshUpdateButton: 'Update DSH',
+      dshUpdating: 'Updating DSH…',
+      dshUpdateStarted: 'Update started; the service restarts in a few seconds…',
+      dshUpdateRestarted: 'Updated to v%s. Refresh the page; DSH rotates its token on restart, so devices must unlock again.',
+      dshUpdateFailed: 'Update failed: %s',
+      dshUpdaterMissing: 'The updater script is not installed: follow the README one-time setup to create ~/.dsh/dsh-update.sh.',
+      dshNodeTooOld: 'Node %s is required; current %s. Upgrade Node first.',
+      dshUpdateInProgress: 'An update is already running; try again later.',
+      dshNodeLine: 'Node %s · requires %s',
       generated: 'Generated.',
       forbidden: 'The server refused this address (403). Check the trustedHosts configuration.',
       expired: 'The sign-in expired; generate a new link.',
@@ -313,6 +331,32 @@ window.__ModuleLoader__.load({
       return candidate !== current
     }
 
+    /** Minimal engines-range check mirroring the host: simple comparison atoms only. */
+    function satisfiesVersionRange(version, range) {
+      if (typeof range !== 'string' || range.trim() === '') return true
+      const parse = (value) => value.replace(/^v/, '').split('-')[0].split('.').map((part) => Number.parseInt(part, 10) || 0)
+      const current = parse(version)
+      for (const token of range.trim().split(/\s+/)) {
+        if (token === '||') continue
+        const match = /^(>=|<=|>|<|=)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(token)
+        if (match === null) continue
+        const target = parse(match[2])
+        let comparison = 0
+        for (let index = 0; index < 3; index += 1) {
+          if (current[index] > target[index]) { comparison = 1; break }
+          if (current[index] < target[index]) { comparison = -1; break }
+        }
+        const operator = match[1] ?? '='
+        const ok = operator === '>=' ? comparison >= 0
+          : operator === '<=' ? comparison <= 0
+            : operator === '>' ? comparison > 0
+              : operator === '<' ? comparison < 0
+                : comparison === 0
+        if (!ok) return false
+      }
+      return true
+    }
+
     /** Read the docked edge and vertical ratio, migrating the old anchor strings. */
     function readPlacement() {
       const raw = readLocal('dshm.handle', '')
@@ -429,6 +473,8 @@ window.__ModuleLoader__.load({
       const [versionsError, setVersionsError] = React.useState(false)
       const [updating, setUpdating] = React.useState(false)
       const [updateStatus, setUpdateStatus] = React.useState(null)
+      const [dshUpdating, setDshUpdating] = React.useState(false)
+      const [dshUpdateStatus, setDshUpdateStatus] = React.useState(null)
 
       const normalizedBase = normalizeBaseText(base)
       const unlockUrl = normalizedBase ? unlockUrlOf(normalizedBase) : ''
@@ -535,6 +581,69 @@ window.__ModuleLoader__.load({
           .then(() => { setUpdating(false) })
       }
 
+      const pollDshUpdate = (attempt) => {
+        if (attempt > 150) {
+          setDshUpdating(false)
+          setDshUpdateStatus({ tone: 'error', text: t('dshUpdateFailed').replace('%s', 'timeout') })
+          return
+        }
+        setTimeout(() => {
+          fetch('/mobile-access/update-status', { credentials: 'same-origin', cache: 'no-store' })
+            .then((response) => response.ok ? response.json() : Promise.reject(new Error('HTTP ' + response.status)))
+            .then((state) => {
+              if (state.state === 'ok') {
+                setDshUpdating(false)
+                setDshUpdateStatus({ tone: 'ok', text: t('dshUpdateRestarted').replace('%s', String(state.to ?? '')) })
+                loadVersions(true)
+                return
+              }
+              if (state.state === 'failed' || state.state === 'rollback') {
+                setDshUpdating(false)
+                setDshUpdateStatus({ tone: 'error', text: t('dshUpdateFailed').replace('%s', String(state.error ?? state.state)) })
+                return
+              }
+              pollDshUpdate(attempt + 1)
+            })
+            .catch(() => pollDshUpdate(attempt + 1))
+        }, 2000)
+      }
+
+      const startDshUpdate = () => {
+        setDshUpdating(true)
+        setDshUpdateStatus(null)
+        const target = versions?.dsh?.latest ?? null
+        fetch('/mobile-access/update-dsh', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(target === null ? {} : { version: target }),
+        })
+          .then((response) => response.json().then((payload) => ({ status: response.status, payload })))
+          .then(({ status, payload }) => {
+            if (status === 202) {
+              setDshUpdateStatus({ tone: 'ok', text: t('dshUpdateStarted') })
+              pollDshUpdate(0)
+              return
+            }
+            setDshUpdating(false)
+            if (payload?.error === 'updater-not-installed') {
+              setDshUpdateStatus({ tone: 'error', text: t('dshUpdaterMissing') })
+            } else if (payload?.error === 'node-too-old') {
+              setDshUpdateStatus({ tone: 'error', text: t('dshNodeTooOld').replace('%s', String(payload.required ?? '')).replace('%s', String(payload.current ?? '')) })
+            } else if (payload?.error === 'update-in-progress') {
+              setDshUpdateStatus({ tone: 'error', text: t('dshUpdateInProgress') })
+            } else if (payload?.reason === 'up-to-date') {
+              setDshUpdateStatus({ tone: 'ok', text: t('versionUpToDate') })
+            } else {
+              setDshUpdateStatus({ tone: 'error', text: t('dshUpdateFailed').replace('%s', String(payload?.detail ?? payload?.error ?? status)) })
+            }
+          })
+          .catch(() => {
+            setDshUpdating(false)
+            setDshUpdateStatus({ tone: 'error', text: t('dshUpdateFailed').replace('%s', 'network') })
+          })
+      }
+
       const footer = status === null ? null : h('p', {
         className: 'dshm-status',
         'data-tone': status.tone,
@@ -543,6 +652,10 @@ window.__ModuleLoader__.load({
 
       const dshOutdated = versions !== null && isNewerVersion(versions.dsh.latest, versions.dsh.current)
       const pluginOutdated = versions !== null && isNewerVersion(versions.plugin.latest, versions.plugin.current)
+      const dshNodeTooOld = versions !== null
+        && typeof versions.dsh.enginesNode === 'string'
+        && !satisfiesVersionRange(versions.dsh.node ?? 'v0.0.0', versions.dsh.enginesNode)
+      const dshUpdaterMissing = versions !== null && versions.dsh.updaterAvailable === false
 
       return h('div', { className: 'dshm-page' },
         h('p', { className: 'dshm-desc' }, t('sectionDesc')),
@@ -681,13 +794,31 @@ window.__ModuleLoader__.load({
           dshOutdated
             ? h('div', null,
               h('p', { className: 'dshm-hint' }, t('dshUpdateHint')),
+              typeof versions.dsh.enginesNode === 'string'
+                ? h('p', { className: 'dshm-hint' }, t('dshNodeLine').replace('%s', String(versions.dsh.node ?? '?')).replace('%s', versions.dsh.enginesNode))
+                : null,
               h('div', { className: 'dshm-row' },
+                h('button', {
+                  type: 'button',
+                  className: 'dshm-btn dshm-btn-primary',
+                  disabled: dshUpdating || dshNodeTooOld || dshUpdaterMissing,
+                  onClick: startDshUpdate,
+                }, dshUpdating ? t('dshUpdating') : t('dshUpdateButton')),
                 h('button', {
                   type: 'button',
                   className: 'dshm-btn',
                   onClick: () => copy('npx -y @deepseek-ai/dsh@latest web'),
-                }, t('copyUpdateCommand'))))
+                }, t('copyUpdateCommand'))),
+              dshUpdaterMissing ? h('p', { className: 'dshm-hint' }, t('dshUpdaterMissing')) : null,
+              dshNodeTooOld
+                ? h('p', { className: 'dshm-hint' }, t('dshNodeTooOld').replace('%s', String(versions.dsh.enginesNode ?? '')).replace('%s', String(versions.dsh.node ?? '')))
+                : null)
             : null,
+          dshUpdateStatus === null ? null : h('p', {
+            className: 'dshm-status',
+            'data-tone': dshUpdateStatus.tone,
+            role: 'status',
+          }, dshUpdateStatus.text),
           updateStatus === null ? null : h('p', {
             className: 'dshm-status',
             'data-tone': updateStatus.tone,

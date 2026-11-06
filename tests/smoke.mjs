@@ -10,12 +10,16 @@
  * Usage: node tests/smoke.mjs
  */
 import { readFile } from 'node:fs/promises'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = dirname(here)
 const failures = []
+const dshHome = mkdtempSync(join(tmpdir(), 'dshm-home-'))
+process.env.DSH_HOME = dshHome
 
 function check(condition, message) {
   if (condition) {
@@ -85,7 +89,7 @@ const ctx = {
 host.apply(ctx)
 
 const byPath = new Map(routes.map((route) => [route.path, route]))
-check(routes.length === 9, `host registers 9 routes (got ${routes.length})`)
+check(routes.length === 11, `host registers 11 routes (got ${routes.length})`)
 check(byPath.get('/unlock')?.kind === 'prefix', 'unlock route is a prefix route')
 check(byPath.get('/manifest.webmanifest')?.kind === 'exact', 'manifest route is exact')
 check(byPath.get('/mobile-access/login-url')?.kind === 'exact', 'login-url route is exact')
@@ -94,7 +98,9 @@ check(byPath.get('/mobile-access/icon-192.png')?.kind === 'exact', 'icon-192 rou
 check(byPath.get('/mobile-access/icon-512.png')?.kind === 'exact', 'icon-512 route is exact')
 check(byPath.get('/mobile-access/icon-maskable-512.png')?.kind === 'exact', 'maskable icon route is exact')
 check(byPath.get('/mobile-access/versions')?.kind === 'exact', 'versions route is exact')
-check(byPath.get('/mobile-access/update-plugin')?.kind === 'exact', 'update route is exact')
+check(byPath.get('/mobile-access/update-plugin')?.kind === 'exact', 'plugin update route is exact')
+check(byPath.get('/mobile-access/update-dsh')?.kind === 'exact', 'dsh update route is exact')
+check(byPath.get('/mobile-access/update-status')?.kind === 'exact', 'dsh update status route is exact')
 
 const unlock = callRoute(byPath.get('/unlock').handler, {
   headers: { 'accept-language': 'zh-CN,zh;q=0.9' },
@@ -178,21 +184,27 @@ check(networksPayload.protocol === 'http:' && networksPayload.port === 3080, 'ne
 check(networksPayload.loopbackOnly === true, 'networks flags a loopback-only listener')
 
 const originalFetch = globalThis.fetch
+let engineRange = '>=24.9.0'
 globalThis.fetch = async (url) => ({
   ok: true,
   status: 200,
-  json: async () => String(url).includes('registry.npmjs.org') ? { version: '9.9.9' } : { tag_name: 'v9.9.8' },
+  json: async () => String(url).includes('registry.npmjs.org')
+    ? { version: '9.9.9', engines: { node: engineRange } }
+    : { tag_name: 'v9.9.8' },
 })
 const versions = await callRouteAsync(byPath.get('/mobile-access/versions').handler, {
   headers: { host: '127.0.0.1:3080' },
 })
-globalThis.fetch = originalFetch
 const versionsPayload = JSON.parse(versions.body)
 check(versions.status === 200, 'versions answers an admitted caller')
 check(versionsPayload.dsh.latest === '9.9.9', 'versions reads the npm registry')
+check(versionsPayload.dsh.enginesNode === '>=24.9.0', 'versions reports the node engine range')
+check(typeof versionsPayload.dsh.node === 'string' && versionsPayload.dsh.node.startsWith('v'), 'versions reports the running node')
 check(versionsPayload.plugin.latest === '9.9.8', 'versions reads the GitHub release tag')
 check(typeof versionsPayload.plugin.current === 'string', 'versions reports the installed plugin version')
+check(versionsPayload.dsh.updaterAvailable === false, 'versions reports a missing updater script')
 
+const admittingConnection = connection
 connection = { admit() { return { rejection: 401 } } }
 const versionsDenied = await callRouteAsync(byPath.get('/mobile-access/versions').handler, {
   headers: { host: '127.0.0.1:3080' },
@@ -200,9 +212,55 @@ const versionsDenied = await callRouteAsync(byPath.get('/mobile-access/versions'
 check(versionsDenied.status === 401, 'versions refuses an unauthenticated caller')
 
 const updateWrongMethod = await callRouteAsync(byPath.get('/mobile-access/update-plugin').handler, { method: 'GET' })
-check(updateWrongMethod.status === 405, 'update route rejects GET')
+check(updateWrongMethod.status === 405, 'plugin update rejects GET')
 const updateDenied = await callRouteAsync(byPath.get('/mobile-access/update-plugin').handler, { method: 'POST' })
-check(updateDenied.status === 401, 'update route refuses an unauthenticated caller')
+check(updateDenied.status === 401, 'plugin update refuses an unauthenticated caller')
+
+// DSH update plumbing: status file plus every refusal path (no real spawn).
+const statusDenied = await callRouteAsync(byPath.get('/mobile-access/update-status').handler, {
+  headers: { host: '127.0.0.1:3080' },
+})
+check(statusDenied.status === 401, 'update-status refuses an unauthenticated caller')
+connection = admittingConnection
+const statusIdle = await callRouteAsync(byPath.get('/mobile-access/update-status').handler, {
+  headers: { host: '127.0.0.1:3080' },
+})
+check(statusIdle.status === 200 && JSON.parse(statusIdle.body).state === 'idle', 'update-status reports idle without a status file')
+
+const dshWrongMethod = await callRouteAsync(byPath.get('/mobile-access/update-dsh').handler, { method: 'GET' })
+check(dshWrongMethod.status === 405, 'dsh update route rejects GET')
+connection = { admit() { return { rejection: 401 } } }
+const dshDenied = await callRouteAsync(byPath.get('/mobile-access/update-dsh').handler, { method: 'POST' })
+check(dshDenied.status === 401, 'dsh update refuses an unauthenticated caller')
+connection = admittingConnection
+
+const dshNoScript = await callRouteAsync(byPath.get('/mobile-access/update-dsh').handler, {
+  method: 'POST',
+  headers: { host: '127.0.0.1:3080' },
+})
+check(dshNoScript.status === 409 && JSON.parse(dshNoScript.body).error === 'updater-not-installed', 'dsh update refuses without the updater script')
+
+writeFileSync(join(dshHome, 'dsh-update.sh'), '#!/bin/sh\nexit 0\n')
+writeFileSync(join(dshHome, 'update-status.json'), JSON.stringify({ at: new Date().toISOString(), state: 'installing' }))
+engineRange = '>=0.0.1'
+const dshInProgress = await callRouteAsync(byPath.get('/mobile-access/update-dsh').handler, {
+  method: 'POST',
+  headers: { host: '127.0.0.1:3080' },
+})
+check(dshInProgress.status === 409 && JSON.parse(dshInProgress.body).error === 'update-in-progress', 'dsh update refuses while another update runs')
+
+rmSync(join(dshHome, 'update-status.json'))
+engineRange = '>=99.0.0'
+const dshNodeTooOld = await callRouteAsync(byPath.get('/mobile-access/update-dsh').handler, {
+  method: 'POST',
+  headers: { host: '127.0.0.1:3080' },
+})
+const nodeTooOldPayload = JSON.parse(dshNodeTooOld.body)
+check(dshNodeTooOld.status === 409 && nodeTooOldPayload.error === 'node-too-old', 'dsh update refuses an unmet node engine')
+check(nodeTooOldPayload.required === '>=99.0.0', 'dsh update reports the required node range')
+
+globalThis.fetch = originalFetch
+rmSync(dshHome, { recursive: true, force: true })
 
 // ------------------------------------------------------------ Browser half
 
